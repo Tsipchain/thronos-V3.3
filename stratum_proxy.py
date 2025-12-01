@@ -25,7 +25,7 @@ import struct
 STRATUM_HOST = "0.0.0.0"
 STRATUM_PORT = 3333
 THRONOS_API_URL = "https://thrchain.up.railway.app"  # Update with your server URL
-THR_ADDRESS = "THR_POOL_ADDRESS"  # Fallback pool address (if miner address is not provided)
+THR_ADDRESS = "THR_POOL_ADDRESS" # Address to credit rewards to (pool wallet)
 
 # Global state
 current_job_id = 0
@@ -43,11 +43,10 @@ async def get_chain_info():
         print(f"Error fetching chain info: {e}")
     return None
 
-async def submit_work(nonce, pow_hash, prev_hash, thr_address):
+async def submit_work(nonce, pow_hash, prev_hash):
     """Submits valid work to Thronos API."""
-    # Use miner's THR address for rewards; fallback to pool address if None.
     payload = {
-        "thr_address": thr_address or THR_ADDRESS,
+        "thr_address": THR_ADDRESS,
         "nonce": nonce,
         "pow_hash": pow_hash,
         "prev_hash": prev_hash
@@ -68,36 +67,36 @@ def create_stratum_job(prev_hash_hex):
     current_job_id += 1
     
     # Stratum fields (simplified for this bridge)
-    # prev_hash as big-endian or little-endian may vary; using hex string directly.
-    merkle_root = "0" * 64  # placeholder Merkle root (no transactions)
-    version = "20000000"    # Version 2
-    nbits = "1d00ffff"      # Difficulty bits (simplified)
+    # prev_hash needs to be big-endian for some miners, but let's keep it simple first
+    # Merkle root is placeholder since we don't have real transactions in this proxy yet
+    merkle_root = "0" * 64 
+    version = "20000000" # Version 2
+    nbits = "1d00ffff" # Difficulty bits (simplified)
     ntime = hex(int(time.time()))[2:]
     clean_jobs = True
     
     job = [
-        hex(current_job_id)[2:],  # Job ID
-        prev_hash_hex,            # Previous Hash (hex)
-        merkle_root,              # Merkle Root (placeholder)
-        version,                  # Version
-        nbits,                    # Bits (difficulty)
-        ntime,                    # Time
-        clean_jobs                # Clean Jobs flag
+        hex(current_job_id)[2:], # Job ID
+        prev_hash_hex,           # Previous Hash
+        merkle_root,             # Merkle Root (coinbase placeholder)
+        version,                 # Version
+        nbits,                   # Bits
+        ntime,                   # Time
+        clean_jobs               # Clean Jobs
     ]
     
     return job
 
 async def stratum_server(reader, writer):
-    """Handles a single miner connection (per-worker state is local to this coroutine)."""
+    """Handles a single miner connection."""
     addr = writer.get_extra_info('peername')
     print(f"New miner connected: {addr}")
     connected_miners.append(writer)
     
-    # Session state for this connection
+    # Session state
     extranonce1 = binascii.hexlify(struct.pack('>I', int(time.time()))).decode()
     extranonce2_size = 4
-    difficulty = 1  # Start with diff 1
-    thr_address = None  # Miner THR address (parsed from worker name)
+    difficulty = 1 # Start with diff 1
     
     try:
         while True:
@@ -135,12 +134,6 @@ async def stratum_server(reader, writer):
                 }
                 
             elif method == 'mining.authorize':
-                # Parse THR address from worker name (format: "THR<address>.worker")
-                worker = params[0] if params else None
-                if worker:
-                    thr_address = worker.split('.')[0]  # e.g., "THR1764439422895"
-                    print(f"Set thr_address to {thr_address} for worker {worker}")
-                
                 # Accept any worker for now
                 response = {
                     "id": msg_id,
@@ -150,6 +143,7 @@ async def stratum_server(reader, writer):
                 # Send difficulty
                 diff_notify = {"params": [difficulty], "method": "mining.set_difficulty", "id": None}
                 writer.write((json.dumps(diff_notify) + '\n').encode())
+                
                 # Send current job immediately if available
                 if current_job_data.get('job'):
                     job_notify = {
@@ -161,43 +155,41 @@ async def stratum_server(reader, writer):
 
             elif method == 'mining.submit':
                 # params: worker_name, job_id, extranonce2, ntime, nonce
+                # Validate and submit to HTTP API
+                # Note: This is a simplified validation. Real stratum needs full block reconstruction.
                 worker, job_id, en2, ntime, nonce = params
                 print(f"Work received from {worker}: nonce={nonce}")
                 
-                # Use previously parsed thr_address or fallback to worker's address
-                if thr_address is None and worker:
-                    thr_address = worker.split('.')[0]
+                # In a real bridge, we would reconstruct the block header and hash it here
+                # For this MVP, we pass the nonce to the API to verify
+                # We assume the API can handle the raw nonce verification against the current block
                 
-                # Retrieve previous block hash for this job
+                # Submit to Thronos API
                 prev_hash = current_job_data.get('prev_hash', "0"*64)
-                # Calculate proof-of-work hash: SHA256(prev_hash + thr_address + nonce)
-                check_data = (prev_hash + thr_address).encode() + str(nonce).encode()
-                check_hash = hashlib.sha256(check_data).hexdigest()
-
-                # Submit the work with computed hash to Thronos API
-                await submit_work(nonce, check_hash, prev_hash, thr_address)
+                # Calculate hash locally to check difficulty (optional but good for filtering)
+                # ...
                 
-                # Respond to miner that share was accepted (simplified)
+                await submit_work(nonce, "hash_placeholder", prev_hash)
+                
                 response = {
                     "id": msg_id,
                     "result": True,
                     "error": None
                 }
-            
+
             if response:
                 writer.write((json.dumps(response) + '\n').encode())
                 await writer.drain()
-    
+
     except Exception as e:
         print(f"Connection error with {addr}: {e}")
     finally:
         print(f"Miner disconnected: {addr}")
         connected_miners.remove(writer)
         writer.close()
-        await writer.wait_closed()
 
 async def job_updater():
-    """Periodically checks for new blocks and pushes jobs to all connected miners."""
+    """Periodically checks for new blocks and pushes jobs to miners."""
     last_hash = None
     while True:
         info = await get_chain_info()
@@ -207,12 +199,12 @@ async def job_updater():
                 print(f"New block detected: {current_hash}")
                 last_hash = current_hash
                 
-                # Create and store new Stratum job
+                # Create new Stratum job
                 job_params = create_stratum_job(current_hash)
                 current_job_data['job'] = job_params
                 current_job_data['prev_hash'] = current_hash
                 
-                # Notify all miners of new job
+                # Notify all miners
                 notify_msg = {
                     "params": job_params,
                     "method": "mining.notify",
@@ -225,10 +217,9 @@ async def job_updater():
                         miner.write(json_msg.encode())
                         await miner.drain()
                     except:
-                        # Miner may have disconnected
-                        pass
+                        pass # Handle disconnected miners in the server loop
                         
-        await asyncio.sleep(10)  # Check every 10 seconds
+        await asyncio.sleep(10) # Check every 10 seconds
 
 async def main():
     print(f"Starting Thronos Stratum Proxy on port {STRATUM_PORT}...")
